@@ -113,3 +113,93 @@ def init_star_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX idx_fact_day_index ON fact_workflow_executions(day_index);
         CREATE INDEX idx_fact_tower_env ON fact_workflow_executions(delivery_tower, system_environment);
         CREATE INDEX idx_fact_stage_vendor ON fact_workflow_executions(process_stage, vendor_tier);
+        CREATE INDEX idx_fact_region_stage ON fact_workflow_executions(region, process_stage);
+
+        CREATE VIEW vw_star_workflow_executions AS
+        SELECT
+            f.execution_id,
+            f.execution_date,
+            f.day_index,
+            f.region,
+            r.theater_group,
+            r.regional_director,
+            f.delivery_tower,
+            t.domain_lead,
+            t.criticality_class,
+            f.process_stage,
+            s.sequence_order,
+            f.shift_tier,
+            sh.operating_window_utc,
+            f.system_environment,
+            e.cloud_provider,
+            f.vendor_tier,
+            v.contract_type,
+            f.sla_met,
+            f.sla_compliance_rate,
+            f.first_pass_yield,
+            f.first_pass_yield_rate,
+            f.mean_resolution_hours,
+            f.target_sla_hours,
+            f.defect_count,
+            f.retry_count,
+            f.error_code,
+            f.pipeline_run_id
+        FROM fact_workflow_executions f
+        JOIN dim_region r ON f.region_id = r.region_id
+        JOIN dim_delivery_tower t ON f.tower_id = t.tower_id
+        JOIN dim_process_stage s ON f.stage_id = s.stage_id
+        JOIN dim_shift_tier sh ON f.shift_id = sh.shift_id
+        JOIN dim_system_environment e ON f.env_id = e.env_id
+        JOIN dim_vendor_tier v ON f.vendor_id = v.vendor_id;
+        """
+    )
+    conn.commit()
+
+
+def is_warehouse_populated(db_path: Path = DB_PATH) -> bool:
+    """Check whether the SQLite warehouse exists and contains the 60-day dataset."""
+    if not db_path.exists():
+        return False
+    try:
+        with get_connection(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='fact_workflow_executions';"
+            )
+            if cursor.fetchone() is None:
+                return False
+            cursor.execute("SELECT COUNT(*), COUNT(DISTINCT execution_date) FROM fact_workflow_executions;")
+            row = cursor.fetchone()
+            if row is None:
+                return False
+            total_rows, distinct_days = row
+            return total_rows >= 50000 and distinct_days == 60
+    except sqlite3.Error:
+        return False
+
+
+def fetch_daily_kpi_series(db_path: Path = DB_PATH) -> pd.DataFrame:
+    """Aggregate daily KPI metrics across the 60-day warehouse horizon."""
+    query = """
+        SELECT
+            execution_date,
+            day_index,
+            COUNT(*) AS total_executions,
+            AVG(sla_compliance_rate) AS sla_compliance_rate,
+            AVG(first_pass_yield_rate) AS first_pass_yield_rate,
+            AVG(mean_resolution_hours) AS mean_resolution_hours,
+            SUM(CASE WHEN sla_met = 0 THEN 1 ELSE 0 END) AS sla_breach_count,
+            SUM(CASE WHEN first_pass_yield = 0 THEN 1 ELSE 0 END) AS fpy_defect_count
+        FROM fact_workflow_executions
+        GROUP BY execution_date, day_index
+        ORDER BY day_index ASC;
+    """
+    with get_connection(db_path) as conn:
+        df = pd.read_sql_query(query, conn)
+    return df
+
+
+def fetch_records_for_dates(
+    dates: List[str],
+    db_path: Path = DB_PATH,
+) -> pd.DataFrame:
