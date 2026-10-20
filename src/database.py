@@ -203,3 +203,102 @@ def fetch_records_for_dates(
     dates: List[str],
     db_path: Path = DB_PATH,
 ) -> pd.DataFrame:
+    """Fetch granular execution records for a specified list of execution dates."""
+    if not dates:
+        return pd.DataFrame()
+    placeholders = ",".join(["?"] * len(dates))
+    query = f"""
+        SELECT
+            execution_id,
+            execution_date,
+            day_index,
+            region,
+            delivery_tower,
+            process_stage,
+            shift_tier,
+            system_environment,
+            vendor_tier,
+            sla_met,
+            sla_compliance_rate,
+            first_pass_yield,
+            first_pass_yield_rate,
+            mean_resolution_hours,
+            target_sla_hours,
+            defect_count,
+            retry_count,
+            error_code,
+            pipeline_run_id
+        FROM fact_workflow_executions
+        WHERE execution_date IN ({placeholders})
+        ORDER BY day_index ASC, execution_id ASC;
+    """
+    with get_connection(db_path) as conn:
+        df = pd.read_sql_query(query, conn, params=dates)
+    return df
+
+
+def fetch_filtered_fact_records(
+    execution_date: str,
+    dimension_filters: Optional[Dict[str, str]] = None,
+    limit: int = 1000,
+    db_path: Path = DB_PATH,
+) -> pd.DataFrame:
+    """Fetch granular execution records for a target date and optional dimensional slice filter."""
+    clauses = ["execution_date = ?"]
+    params: List[Any] = [execution_date]
+
+    if dimension_filters:
+        for dim_col, dim_val in dimension_filters.items():
+            if dim_col in DIMENSIONS and dim_val:
+                clauses.append(f"{dim_col} = ?")
+                params.append(dim_val)
+
+    where_sql = " AND ".join(clauses)
+    query = f"""
+        SELECT
+            execution_id,
+            execution_date,
+            day_index,
+            region,
+            delivery_tower,
+            process_stage,
+            shift_tier,
+            system_environment,
+            vendor_tier,
+            sla_met,
+            sla_compliance_rate,
+            first_pass_yield,
+            first_pass_yield_rate,
+            mean_resolution_hours,
+            target_sla_hours,
+            defect_count,
+            retry_count,
+            error_code,
+            pipeline_run_id
+        FROM fact_workflow_executions
+        WHERE {where_sql}
+        ORDER BY sla_met ASC, first_pass_yield ASC, mean_resolution_hours DESC, execution_id ASC
+        LIMIT ?;
+    """
+    params.append(limit)
+    with get_connection(db_path) as conn:
+        df = pd.read_sql_query(query, conn, params=params)
+    return df
+
+
+def fetch_dimension_catalog(db_path: Path = DB_PATH) -> Dict[str, pd.DataFrame]:
+    """Return all Star-Schema dimension tables as DataFrames for reference."""
+    tables = [
+        "dim_region",
+        "dim_delivery_tower",
+        "dim_process_stage",
+        "dim_shift_tier",
+        "dim_system_environment",
+        "dim_vendor_tier",
+    ]
+    catalog: Dict[str, pd.DataFrame] = {}
+    with get_connection(db_path) as conn:
+        for tbl in tables:
+            catalog[tbl] = pd.read_sql_query(f"SELECT * FROM {tbl};", conn)
+    return catalog
+
