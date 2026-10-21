@@ -318,3 +318,195 @@ def generate_warehouse_data(db_path: Path = DB_PATH, force_rebuild: bool = False
         if day_idx == 52:
             # Day 52 Defect Leakage Spike: 95.1% -> 84.6% (846 pass, 154 fail)
             # Primary slice: (UAT Validation, Tier-2 Contractor) has 190 records
+            # Set 92 failures in primary slice (98 pass -> 51.58% FPY)
+            fpy_primary_mask = (
+                (df_day["process_stage"] == "UAT Validation")
+                & (df_day["vendor_tier"] == "Tier-2 Contractor")
+            )
+            fpy_primary_idx = df_day[fpy_primary_mask].index
+            fpy_non_primary_idx = df_day[~fpy_primary_mask].index
+
+            fpy_arr[fpy_primary_idx[:92]] = 0
+            fpy_arr[fpy_non_primary_idx[:62]] = 0  # 92 + 62 = 154 total failures -> 846 pass (84.6%)
+        else:
+            if 38 <= day_idx <= 51:
+                total_fpy_pass = 951 + fpy_offsets_14[day_idx - 38]
+                fpy_primary_fails = 9  # 171 / 180 = 95.0% baseline in (UAT Validation, Tier-2 Contractor)
+            else:
+                wave_fpy = int(np.round(4.0 * np.cos(day_idx * 0.55)))
+                total_fpy_pass = 951 + wave_fpy
+                fpy_primary_fails = 9
+
+            total_fpy_fails = n_day - total_fpy_pass
+            fpy_primary_mask = (
+                (df_day["process_stage"] == "UAT Validation")
+                & (df_day["vendor_tier"] == "Tier-2 Contractor")
+            )
+            p_idx = rng.permutation(df_day[fpy_primary_mask].index)
+            np_idx = rng.permutation(df_day[~fpy_primary_mask].index)
+
+            fpy_arr[p_idx[:fpy_primary_fails]] = 0
+            fpy_arr[np_idx[: max(0, total_fpy_fails - fpy_primary_fails)]] = 0
+
+        # ------------------------------------------------------------------
+        # 3. MEAN RESOLUTION HOURS GENERATION
+        # ------------------------------------------------------------------
+        res_primary_mask = (
+            (df_day["region"] == "DACH")
+            & (df_day["process_stage"] == "Security Sign-Off")
+        )
+        res_hours = np.zeros(n_day, dtype=float)
+
+        if day_idx == 45:
+            # Day 45 Turnaround Surge: 4.20h -> 7.90h
+            # Primary slice: (DACH, Security Sign-Off) has 170 records -> mean 21.95h
+            # Remaining 830 records -> mean 5.02229h so overall mean across 1000 is 7.90h
+            p_indices = df_day[res_primary_mask].index
+            np_indices = df_day[~res_primary_mask].index
+
+            p_noise = rng.normal(0.0, 1.8, size=len(p_indices))
+            p_noise = p_noise - np.mean(p_noise)
+            res_hours[p_indices] = np.clip(21.95 + p_noise, 8.0, 36.0)
+            # Re-center exactly to 21.95
+            res_hours[p_indices] += 21.95 - np.mean(res_hours[p_indices])
+
+            target_non_primary_mean = (7.90 * n_day - 21.95 * len(p_indices)) / len(np_indices)
+            np_noise = rng.normal(0.0, 0.45, size=len(np_indices))
+            res_hours[np_indices] = np.clip(target_non_primary_mean + np_noise, 1.5, 11.0)
+            res_hours[np_indices] += target_non_primary_mean - np.mean(res_hours[np_indices])
+        else:
+            if 31 <= day_idx <= 44:
+                day_target_mean = 4.20 + res_offsets_14[day_idx - 31]
+                primary_target_mean = 4.25
+            else:
+                day_target_mean = 4.20 + 0.09 * np.sin(day_idx * 0.5)
+                primary_target_mean = 4.25
+
+            p_indices = df_day[res_primary_mask].index
+            np_indices = df_day[~res_primary_mask].index
+
+            p_vals = rng.normal(primary_target_mean, 0.35, size=len(p_indices))
+            p_vals = np.clip(p_vals, 2.0, 7.5)
+            p_vals += primary_target_mean - np.mean(p_vals)
+            res_hours[p_indices] = p_vals
+
+            np_target_mean = (day_target_mean * n_day - primary_target_mean * len(p_indices)) / len(
+                np_indices
+            )
+            np_vals = rng.normal(np_target_mean, 0.35, size=len(np_indices))
+            np_vals = np.clip(np_vals, 1.8, 7.5)
+            np_vals += np_target_mean - np.mean(np_vals)
+            res_hours[np_indices] = np_vals
+
+        # Build rows for SQLite insertion
+        for idx in range(n_day):
+            row = df_day.iloc[idx]
+            r_name = row["region"]
+            t_name = row["delivery_tower"]
+            s_name = row["process_stage"]
+            sh_name = row["shift_tier"]
+            e_name = row["system_environment"]
+            v_name = row["vendor_tier"]
+
+            sla_flag = int(sla_met_arr[idx])
+            fpy_flag = int(fpy_arr[idx])
+            r_hrs = float(np.round(res_hours[idx], 4))
+            target_sla = float(stage_sla_map[s_name])
+
+            # Assign diagnostic error codes for root-cause inspection
+            if day_idx == 60 and sla_flag == 0 and t_name == "Core Data Engineering" and e_name == "Snowflake-Prod-EU":
+                err_code = "ERR_SF_TIMEOUT_504"
+                retries = 3
+            elif day_idx == 52 and fpy_flag == 0 and s_name == "UAT Validation" and v_name == "Tier-2 Contractor":
+                err_code = "ERR_UAT_SCHEMA_MISMATCH"
+                retries = 2
+            elif day_idx == 45 and r_name == "DACH" and s_name == "Security Sign-Off" and r_hrs > 12.0:
+                err_code = "ERR_SEC_POLICY_HOLD"
+                retries = 2
+            elif sla_flag == 0:
+                err_code = "ERR_WORKER_QUEUE_LAG"
+                retries = 1
+            elif fpy_flag == 0:
+                err_code = "ERR_VALIDATION_ASSERT"
+                retries = 1
+            else:
+                err_code = "NONE"
+                retries = 0
+
+            defects = 0 if fpy_flag == 1 else int(rng.integers(1, 4))
+            exec_id = f"WF-{date_compact}-{idx + 1:04d}"
+            pipe_id = f"PIPE-{day_idx:02d}-{(idx % 25) + 1:02d}"
+
+            all_fact_rows.append(
+                (
+                    exec_id,
+                    date_str,
+                    day_idx,
+                    region_map[r_name],
+                    tower_map[t_name],
+                    stage_map[s_name],
+                    shift_map[sh_name],
+                    env_map[e_name],
+                    vendor_map[v_name],
+                    r_name,
+                    t_name,
+                    s_name,
+                    sh_name,
+                    e_name,
+                    v_name,
+                    sla_flag,
+                    100.0 * sla_flag,
+                    fpy_flag,
+                    100.0 * fpy_flag,
+                    r_hrs,
+                    target_sla,
+                    defects,
+                    retries,
+                    err_code,
+                    pipe_id,
+                )
+            )
+
+    with get_connection(db_path) as conn:
+        init_star_schema(conn)
+        cursor = conn.cursor()
+
+        cursor.executemany(
+            "INSERT INTO dim_region VALUES (?, ?, ?, ?);",
+            DIMENSION_METADATA["dim_region"],
+        )
+        cursor.executemany(
+            "INSERT INTO dim_delivery_tower VALUES (?, ?, ?, ?);",
+            DIMENSION_METADATA["dim_delivery_tower"],
+        )
+        cursor.executemany(
+            "INSERT INTO dim_process_stage VALUES (?, ?, ?, ?);",
+            DIMENSION_METADATA["dim_process_stage"],
+        )
+        cursor.executemany(
+            "INSERT INTO dim_shift_tier VALUES (?, ?, ?, ?);",
+            DIMENSION_METADATA["dim_shift_tier"],
+        )
+        cursor.executemany(
+            "INSERT INTO dim_system_environment VALUES (?, ?, ?, ?);",
+            DIMENSION_METADATA["dim_system_environment"],
+        )
+        cursor.executemany(
+            "INSERT INTO dim_vendor_tier VALUES (?, ?, ?, ?);",
+            DIMENSION_METADATA["dim_vendor_tier"],
+        )
+
+        cursor.executemany(
+            """
+            INSERT INTO fact_workflow_executions VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            );
+            """,
+            all_fact_rows,
+        )
+        conn.commit()
+
+
+if __name__ == "__main__":
+    generate_warehouse_data(force_rebuild=True)
+    print(f"Populated SQLite warehouse at {DB_PATH}")
