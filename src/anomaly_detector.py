@@ -113,3 +113,66 @@ class KPIAnomalyDetector:
 
         # Bollinger-style upper and lower control bands around the prior 14-day baseline mean
         df["upper_band"] = df["prior_14d_mean"] + (self.z_threshold * df["rolling_std"])
+        df["lower_band"] = df["prior_14d_mean"] - (self.z_threshold * df["rolling_std"])
+
+        # Interquartile Range (IQR) bounds across the 60-day surveillance horizon
+        q25 = float(np.percentile(series, 25))
+        q75 = float(np.percentile(series, 75))
+        iqr = max(q75 - q25, 1e-6)
+        df["iqr_lower"] = q25 - 1.5 * iqr
+        df["iqr_upper"] = q75 + 1.5 * iqr
+        df["is_iqr_outlier"] = (df["kpi_value"] < df["iqr_lower"]) | (
+            df["kpi_value"] > df["iqr_upper"]
+        )
+
+        # Anomaly classification and severity grading
+        df["is_anomaly"] = df["abs_z_score"] >= self.z_threshold
+        df["anomaly_flag"] = np.where(
+            df["is_anomaly"], "ANOMALY_DETECTED", "NORMAL"
+        )
+        df["severity"] = np.select(
+            [
+                df["abs_z_score"] >= self.high_severity_threshold,
+                df["abs_z_score"] >= self.z_threshold,
+            ],
+            [
+                "SEVERITY_HIGH",
+                "SEVERITY_MODERATE",
+            ],
+            default="NORMAL",
+        )
+        df["status_badge"] = np.select(
+            [
+                df["abs_z_score"] >= self.high_severity_threshold,
+                df["abs_z_score"] >= self.z_threshold,
+            ],
+            [
+                "CRITICAL ANOMALY",
+                "MODERATE ANOMALY",
+            ],
+            default="WITHIN CONTROL BOUNDS",
+        )
+
+        return df
+
+    @staticmethod
+    def get_baseline_dates(
+        surveillance_df: pd.DataFrame,
+        target_date: str,
+        baseline_mode: str = "Prior 14-Day Baseline",
+    ) -> List[str]:
+        """Return the list of execution dates composing the comparison baseline window."""
+        df = surveillance_df.sort_values("day_index").reset_index(drop=True)
+        match = df[df["execution_date"] == target_date]
+        if match.empty:
+            raise ValueError(f"Target date '{target_date}' not found in surveillance series.")
+
+        target_pos = int(match.index[0])
+        if target_pos == 0:
+            # Edge case if Day 1 is selected: fallback to first available normal days
+            return df.iloc[1 : min(15, len(df))]["execution_date"].tolist()
+
+        if baseline_mode == "Prior Day (DoD)":
+            window_size = 1
+        elif baseline_mode == "Prior 7-Day Baseline":
+            window_size = PRIOR_7D_WINDOW_DAYS
