@@ -176,3 +176,62 @@ class KPIAnomalyDetector:
             window_size = 1
         elif baseline_mode == "Prior 7-Day Baseline":
             window_size = PRIOR_7D_WINDOW_DAYS
+        else:
+            window_size = ROLLING_WINDOW_DAYS
+
+        start_pos = max(0, target_pos - window_size)
+        return df.iloc[start_pos:target_pos]["execution_date"].tolist()
+
+    def get_target_day_summary(
+        self,
+        surveillance_df: pd.DataFrame,
+        target_date: str,
+        baseline_mode: str = "Prior 14-Day Baseline",
+    ) -> Dict[str, Any]:
+        """Extract summary KPI metrics for the selected Target Date and Baseline Comparison Mode."""
+        match = surveillance_df[surveillance_df["execution_date"] == target_date]
+        if match.empty:
+            raise ValueError(f"Target date '{target_date}' not found in surveillance series.")
+
+        row = match.iloc[0]
+        if baseline_mode == "Prior Day (DoD)":
+            baseline_val = float(row["prior_day_value"])
+            abs_delta = float(row["dod_delta"])
+            rel_pct = float(row["dod_pct_change"])
+        elif baseline_mode == "Prior 7-Day Baseline":
+            baseline_val = float(row["prior_7d_mean"])
+            abs_delta = float(row["prior_7d_delta"])
+            rel_pct = float(row["prior_7d_pct_change"])
+        else:
+            baseline_val = float(row["prior_14d_mean"])
+            abs_delta = float(row["prior_14d_delta"])
+            rel_pct = float(row["prior_14d_pct_change"])
+
+        baseline_dates = self.get_baseline_dates(surveillance_df, target_date, baseline_mode)
+
+        return {
+            "execution_date": str(row["execution_date"]),
+            "day_index": int(row["day_index"]),
+            "target_value": float(row["kpi_value"]),
+            "baseline_value": baseline_val,
+            "abs_delta": abs_delta,
+            "rel_pct_change": rel_pct,
+            "rolling_mean": float(row["rolling_mean"]),
+            "rolling_std": float(row["rolling_std"]),
+            "upper_band": float(row["upper_band"]),
+            "lower_band": float(row["lower_band"]),
+            "z_score": float(row["z_score"]),
+            "abs_z_score": float(row["abs_z_score"]),
+            "p_value": float(row["p_value"]),
+            "iqr_lower": float(row["iqr_lower"]),
+            "iqr_upper": float(row["iqr_upper"]),
+            "is_iqr_outlier": bool(row["is_iqr_outlier"]),
+            "is_anomaly": bool(row["is_anomaly"]),
+            "anomaly_flag": str(row["anomaly_flag"]),
+            "severity": str(row["severity"]),
+            "status_badge": str(row["status_badge"]),
+            "baseline_mode": baseline_mode,
+            "baseline_dates": baseline_dates,
+            "baseline_days_count": len(baseline_dates),
+        }
+
