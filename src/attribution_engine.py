@@ -263,3 +263,172 @@ class VarianceAttributionEngine:
         abs_delta = abs(total_delta)
 
         if unit == "%":
+            delta_phrase = f"{abs_delta:.1f} percentage points"
+        else:
+            delta_phrase = f"{abs_delta:.2f} hours"
+
+        p_str = "p < 0.0001" if p_value < 0.0001 else f"p = {p_value:.4f}"
+
+        slice_label = str(top_driver_row["slice_label"])
+        var_explained = float(top_driver_row["variance_explained_pct"])
+        b_slice = float(top_driver_row["baseline_metric"])
+        t_slice = float(top_driver_row["target_metric"])
+        t_vol = int(top_driver_row["target_volume"])
+        rate_pct = float(top_driver_row["rate_share_of_slice_pct"])
+        mix_pct = float(top_driver_row["mix_share_of_slice_pct"])
+
+        change_verb = "dropped" if t_slice < b_slice else "surged"
+        degradation_noun = "degradation" if (
+            (higher_is_better and total_delta < 0) or (not higher_is_better and total_delta > 0)
+        ) else "variance"
+
+        narrative = (
+            f"Top-level {kpi_label} {direction_word} by {delta_phrase} "
+            f"({baseline_overall:.{decimals}f}{unit} to {target_overall:.{decimals}f}{unit}, "
+            f"Z = {z_score:+.2f}, {p_str}). "
+            f"Primary Root Cause: {var_explained:.1f}% of the total {degradation_noun} is isolated to "
+            f"[{slice_label}], where performance {change_verb} from "
+            f"{b_slice:.{decimals}f}{unit} to {t_slice:.{decimals}f}{unit} across {t_vol} executions "
+            f"({rate_pct:.1f}% driven by Pure Rate Degradation, {mix_pct:.1f}% by Volume Mix Shift)."
+        )
+
+        if tree_rules:
+            top_leaf = tree_rules[0]
+            narrative += (
+                f" Decision-Tree Micro-Cluster Rule: [{top_leaf['rule_path']}] "
+                f"recorded {top_leaf['leaf_metric']:.{decimals}f}{unit} across {top_leaf['sample_count']} executions."
+            )
+
+        return narrative
+
+    def run_full_attribution(
+        self,
+        baseline_df: pd.DataFrame,
+        target_df: pd.DataFrame,
+        kpi_key: str,
+        z_score: float = 0.0,
+        p_value: float = 1.0,
+    ) -> Dict[str, Any]:
+        """
+        Execute full 1D and 2D variance attribution, decision tree rule extraction,
+        and executive narrative generation.
+        """
+        if kpi_key not in SUPPORTED_KPIS:
+            raise ValueError(f"Unsupported KPI key: {kpi_key}")
+        if baseline_df.empty or target_df.empty:
+            raise ValueError("Baseline and Target DataFrames must be non-empty.")
+
+        # Compute top-level KPI values
+        # Note: If baseline_df spans multiple dayswith equal daily volume, record-level mean == daily mean.
+        baseline_overall = float(baseline_df[kpi_key].mean())
+        target_overall = float(target_df[kpi_key].mean())
+        total_delta = target_overall - baseline_overall
+
+        # 1. Single-Dimension (1D) Attribution
+        frames_1d: List[pd.DataFrame] = []
+        for dim in self.dimensions:
+            df_slice = self._compute_slice_attribution(
+                baseline_df=baseline_df,
+                target_df=target_df,
+                group_cols=[dim],
+                kpi_key=kpi_key,
+                baseline_overall=baseline_overall,
+                target_overall=target_overall,
+            )
+            frames_1d.append(df_slice)
+
+        df_1d_all = pd.concat(frames_1d, ignore_index=True)
+        df_1d_ranked = df_1d_all.sort_values(
+            by=["variance_explained_pct", "target_volume"],
+            ascending=[False, False],
+        ).reset_index(drop=True)
+
+        # 2. Two-Way Combinatorial (2D) Attribution
+        frames_2d: List[pd.DataFrame] = []
+        for dim1, dim2 in combinations(self.dimensions, 2):
+            df_slice_2d = self._compute_slice_attribution(
+                baseline_df=baseline_df,
+                target_df=target_df,
+                group_cols=[dim1, dim2],
+                kpi_key=kpi_key,
+                baseline_overall=baseline_overall,
+                target_overall=target_overall,
+            )
+            frames_2d.append(df_slice_2d)
+
+        df_2d_all = pd.concat(frames_2d, ignore_index=True)
+        df_2d_ranked = df_2d_all.sort_values(
+            by=["variance_explained_pct", "target_volume"],
+            ascending=[False, False],
+        ).reset_index(drop=True)
+
+        # 3. Combined Leaderboard (1D + 2D)
+        common_cols = [
+            "dimension_type",
+            "dimension_key",
+            "dimension_label",
+            "slice_label",
+            "slice_short_label",
+            "slice_filter",
+            "baseline_volume",
+            "target_volume",
+            "baseline_share",
+            "target_share",
+            "baseline_metric",
+            "target_metric",
+            "metric_delta",
+            "share_delta",
+            "rate_effect",
+            "mix_effect",
+            "total_contribution",
+            "variance_explained_pct",
+            "rate_share_of_slice_pct",
+            "mix_share_of_slice_pct",
+            "t_statistic",
+            "p_value",
+            "is_significant",
+        ]
+        combined_leaderboard = (
+            pd.concat([df_1d_ranked[common_cols], df_2d_ranked[common_cols]], ignore_index=True)
+            .sort_values(by=["variance_explained_pct", "target_volume"], ascending=[False, False])
+            .reset_index(drop=True)
+        )
+
+        # Primary root cause driver (top significant 2D slice, fallback to top 2D slice)
+        sig_2d = df_2d_ranked[df_2d_ranked["is_significant"]]
+        top_2d_row = sig_2d.iloc[0] if not sig_2d.empty else df_2d_ranked.iloc[0]
+        top_1d_row = df_1d_ranked.iloc[0]
+
+        # 4. Shallow Decision Tree Failure Cluster Rules
+        tree_rules = self.extract_decision_tree_rules(
+            target_df=target_df,
+            kpi_key=kpi_key,
+            max_depth=3,
+            min_samples_leaf=20,
+        )
+
+        # 5. Executive Narrative Synthesis
+        narrative = self.generate_executive_narrative(
+            kpi_key=kpi_key,
+            baseline_overall=baseline_overall,
+            target_overall=target_overall,
+            z_score=z_score,
+            p_value=p_value,
+            top_driver_row=top_2d_row,
+            tree_rules=tree_rules,
+        )
+
+        return {
+            "kpi_key": kpi_key,
+            "baseline_overall": baseline_overall,
+            "target_overall": target_overall,
+            "total_delta": total_delta,
+            "df_1d": df_1d_ranked,
+            "df_2d": df_2d_ranked,
+            "combined_leaderboard": combined_leaderboard,
+            "top_1d_driver": top_1d_row.to_dict(),
+            "top_2d_driver": top_2d_row.to_dict(),
+            "decision_tree_rules": tree_rules,
+            "executive_narrative": narrative,
+        }
+
