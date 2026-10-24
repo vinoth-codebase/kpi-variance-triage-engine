@@ -118,3 +118,148 @@ class VarianceAttributionEngine:
                 std1=merged["target_std"].to_numpy(dtype=float),
                 nobs1=np.maximum(merged["target_volume"].to_numpy(dtype=float), 2.0),
                 mean2=merged["baseline_metric"].to_numpy(dtype=float),
+                std2=merged["baseline_std"].to_numpy(dtype=float),
+                nobs2=np.maximum(merged["baseline_volume"].to_numpy(dtype=float), 2.0),
+                equal_var=False,
+            )
+
+        valid_mask = (merged["baseline_volume"] >= 2) & (merged["target_volume"] >= 2)
+        nonzero_std_mask = (merged["baseline_std"] > 1e-12) | (merged["target_std"] > 1e-12)
+
+        t_stat_arr = np.where(
+            valid_mask & nonzero_std_mask,
+            np.nan_to_num(t_res.statistic, nan=0.0, posinf=0.0, neginf=0.0),
+            0.0,
+        )
+        p_val_arr = np.where(
+            valid_mask & nonzero_std_mask,
+            np.nan_to_num(t_res.pvalue, nan=1.0, posinf=1.0, neginf=1.0),
+            1.0,
+        )
+
+        merged["t_statistic"] = t_stat_arr
+        merged["p_value"] = p_val_arr
+        merged["is_significant"] = (merged["p_value"] < self.alpha) & (
+            merged["target_volume"] >= self.min_slice_volume
+        )
+
+        # Metadata columns for unified leaderboard ranking
+        dim_type = "1D" if len(group_cols) == 1 else "2D"
+        dim_key = " | ".join(group_cols)
+        dim_label = " x ".join(DIMENSION_LABELS.get(c, c) for c in group_cols)
+
+        slice_labels: List[str] = []
+        slice_short_labels: List[str] = []
+        slice_filters: List[Dict[str, str]] = []
+
+        for _, row in merged.iterrows():
+            parts = [f"{c} = {row[c]}" for c in group_cols]
+            short_parts = [str(row[c]) for c in group_cols]
+            slice_labels.append(" | ".join(parts))
+            slice_short_labels.append(" + ".join(short_parts))
+            slice_filters.append({c: str(row[c]) for c in group_cols})
+
+        merged["dimension_type"] = dim_type
+        merged["dimension_key"] = dim_key
+        merged["dimension_label"] = dim_label
+        merged["slice_label"] = slice_labels
+        merged["slice_short_label"] = slice_short_labels
+        merged["slice_filter"] = slice_filters
+
+        return merged
+
+    def extract_decision_tree_rules(
+        self,
+        target_df: pd.DataFrame,
+        kpi_key: str,
+        max_depth: int = 3,
+        min_samples_leaf: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """
+        Train a shallow scikit-learn DecisionTreeRegressor on the target day's records
+        to extract human-readable decision path rules for the highest-density failure clusters.
+        """
+        if target_df.empty:
+            return []
+
+        kpi_meta = SUPPORTED_KPIS[kpi_key]
+        higher_is_better = bool(kpi_meta["higher_is_better"])
+        overall_mean = float(target_df[kpi_key].mean())
+
+        X_df = pd.get_dummies(target_df[self.dimensions], prefix_sep=" == ", dtype=float)
+        feature_names = list(X_df.columns)
+        y = target_df[kpi_key].to_numpy(dtype=float)
+
+        tree_model = DecisionTreeRegressor(
+            max_depth=max_depth,
+            min_samples_leaf=min_samples_leaf,
+            random_state=RANDOM_SEED,
+        )
+        tree_model.fit(X_df, y)
+
+        tree_ = tree_model.tree_
+        leaf_rules: List[Dict[str, Any]] = []
+
+        def _recurse(node_id: int, path_conditions: List[str]) -> None:
+            left_child = int(tree_.children_left[node_id])
+            right_child = int(tree_.children_right[node_id])
+
+            if left_child == right_child:  # Leaf node
+                leaf_val = float(tree_.value[node_id][0][0])
+                leaf_count = int(tree_.n_node_samples[node_id])
+                deviation = leaf_val - overall_mean
+                adverse_score = -deviation if higher_is_better else deviation
+
+                # Simplify path conditions: prioritize equality conditions if present
+                eq_conds = [c for c in path_conditions if " == " in c]
+                neq_conds = [c for c in path_conditions if " != " in c]
+                ordered_conds = eq_conds + neq_conds
+                rule_str = " AND ".join(ordered_conds) if ordered_conds else "All Executions"
+
+                leaf_rules.append(
+                    {
+                        "rule_path": rule_str,
+                        "equality_conditions": eq_conds,
+                        "sample_count": leaf_count,
+                        "sample_share_pct": (leaf_count / max(len(target_df), 1)) * 100.0,
+                        "leaf_metric": leaf_val,
+                        "overall_metric": overall_mean,
+                        "metric_deviation": deviation,
+                        "adverse_score": adverse_score,
+                    }
+                )
+                return
+
+            feat_idx = int(tree_.feature[node_id])
+            feat_name = feature_names[feat_idx]
+            # Left child corresponds to feature <= 0.5 (not equal)
+            _recurse(left_child, path_conditions + [feat_name.replace(" == ", " != ")])
+            # Right child corresponds to feature > 0.5 (equal)
+            _recurse(right_child, path_conditions + [feat_name])
+
+        _recurse(0, [])
+        leaf_rules.sort(key=lambda r: r["adverse_score"], reverse=True)
+        return leaf_rules
+
+    def generate_executive_narrative(
+        self,
+        kpi_key: str,
+        baseline_overall: float,
+        target_overall: float,
+        z_score: float,
+        p_value: float,
+        top_driver_row: pd.Series,
+        tree_rules: List[Dict[str, Any]],
+    ) -> str:
+        """Synthesize a plain-English consulting diagnostic brief."""
+        kpi_meta = SUPPORTED_KPIS[kpi_key]
+        kpi_label = str(kpi_meta["label"])
+        unit = str(kpi_meta["value_suffix"])
+        decimals = int(kpi_meta["decimals"])
+        higher_is_better = bool(kpi_meta["higher_is_better"])
+
+        total_delta = target_overall - baseline_overall
+        direction_word = "decreased" if total_delta < 0 else "increased"
+        abs_delta = abs(total_delta)
+
+        if unit == "%":
