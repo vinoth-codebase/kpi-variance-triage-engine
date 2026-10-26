@@ -200,3 +200,67 @@ def generate_audit_pack_excel(
 
     _apply_sheet_styling(ws_1d, header_row=1)
 
+    # ------------------------------------------------------------------
+    # Sheet 3: 2D_Interaction_Ranking
+    # ------------------------------------------------------------------
+    ws_2d = wb.create_sheet(title="2D_Interaction_Ranking")
+    df_2d = attribution_results["df_2d"]
+    for c_idx, (_, col_title) in enumerate(cols_export, start=1):
+        ws_2d.cell(row=1, column=c_idx, value=col_title)
+
+    for r_idx, (_, row) in enumerate(df_2d.iterrows(), start=2):
+        for c_idx, (col_key, _) in enumerate(cols_export, start=1):
+            val = row[col_key]
+            if isinstance(val, (bool, np.bool_)):
+                val = "YES" if bool(val) else "NO"
+            elif isinstance(val, (float, np.floating)):
+                val = round(float(val), 6)
+            elif isinstance(val, (int, np.integer)):
+                val = int(val)
+            ws_2d.cell(row=r_idx, column=c_idx, value=val)
+
+    _apply_sheet_styling(ws_2d, header_row=1)
+
+    # ------------------------------------------------------------------
+    # Sheet 4: Anomalous_Raw_Records
+    # ------------------------------------------------------------------
+    ws_raw = wb.create_sheet(title="Anomalous_Raw_Records")
+    raw_cols = [
+        "execution_id",
+        "execution_date",
+        "region",
+        "delivery_tower",
+        "process_stage",
+        "shift_tier",
+        "system_environment",
+        "vendor_tier",
+        "sla_met",
+        "sla_compliance_rate",
+        "first_pass_yield",
+        "first_pass_yield_rate",
+        "mean_resolution_hours",
+        "target_sla_hours",
+        "defect_count",
+        "retry_count",
+        "error_code",
+        "pipeline_run_id",
+    ]
+    available_cols = [c for c in raw_cols if c in raw_records_df.columns]
+
+    for c_idx, col_name in enumerate(available_cols, start=1):
+        ws_raw.cell(row=1, column=c_idx, value=col_name)
+
+    for r_idx, (_, row) in enumerate(raw_records_df[available_cols].iterrows(), start=2):
+        for c_idx, col_name in enumerate(available_cols, start=1):
+            val = row[col_name]
+            if isinstance(val, (float, np.floating)):
+                val = round(float(val), 4)
+            elif isinstance(val, (int, np.integer)):
+                val = int(val)
+            ws_raw.cell(row=r_idx, column=c_idx, value=val)
+
+    _apply_sheet_styling(ws_raw, header_row=1)
+
+    wb.save(str(file_path))
+    return file_path
+
