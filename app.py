@@ -308,3 +308,253 @@ def build_surveillance_chart(
             y=surveillance_df["lower_band"],
             mode="lines",
             line=dict(width=1, color="rgba(148, 163, 184, 0.45)", dash="dot"),
+            fill="tonexty",
+            fillcolor="rgba(226, 232, 240, 0.42)",
+            name=f"Control Band (+/- {z_threshold:.1f} SD)",
+        )
+    )
+
+    # Prior 14-Day Rolling Baseline
+    fig.add_trace(
+        go.Scatter(
+            x=surveillance_df["execution_date"],
+            y=surveillance_df["prior_14d_mean"],
+            mode="lines",
+            line=dict(color=COLOR_PALETTE["slate"], width=1.8, dash="dash"),
+            name="14-Day Rolling Baseline",
+            hovertemplate="Date: %{x}<br>14D Baseline: %{y:.2f}" + unit + "<extra></extra>",
+        )
+    )
+
+    # Daily KPI Value Trend
+    fig.add_trace(
+        go.Scatter(
+            x=surveillance_df["execution_date"],
+            y=surveillance_df["kpi_value"],
+            mode="lines+markers",
+            line=dict(color=COLOR_PALETTE["navy"], width=2.4),
+            marker=dict(size=5, color=COLOR_PALETTE["navy"]),
+            name=f"Daily {label}",
+            customdata=np.stack(
+                [
+                    surveillance_df["day_index"],
+                    surveillance_df["z_score"],
+                    surveillance_df["status_badge"],
+                ],
+                axis=-1,
+            ),
+            hovertemplate=(
+                "<b>Date: %{x} (Day %{customdata[0]})</b><br>"
+                f"{label}: %{{y:.2f}}{unit}<br>"
+                "Z-Score: %{customdata[1]:+.2f}<br>"
+                "Status: %{customdata[2]}<extra></extra>"
+            ),
+        )
+    )
+
+    # Highlighted Statistical Anomalies
+    anomalies = surveillance_df[surveillance_df["is_anomaly"]]
+    if not anomalies.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=anomalies["execution_date"],
+                y=anomalies["kpi_value"],
+                mode="markers",
+                marker=dict(
+                    size=12,
+                    color=COLOR_PALETTE["crimson"],
+                    symbol="diamond",
+                    line=dict(width=2, color="#FFFFFF"),
+                ),
+                name="Detected Statistical Anomaly",
+                customdata=np.stack(
+                    [
+                        anomalies["day_index"],
+                        anomalies["z_score"],
+                        anomalies["p_value"],
+                    ],
+                    axis=-1,
+                ),
+                hovertemplate=(
+                    "<b>ANOMALY DETECTED: %{x} (Day %{customdata[0]})</b><br>"
+                    f"Observed {label}: %{{y:.2f}}{unit}<br>"
+                    "Z-Score: %{customdata[1]:+.2f} (p = %{customdata[2]:.5f})<extra></extra>"
+                ),
+            )
+        )
+
+    # Selected Target Date Marker
+    selected_row = surveillance_df[surveillance_df["execution_date"] == selected_date]
+    if not selected_row.empty:
+        fig.add_vline(
+            x=selected_date,
+            line_width=1.6,
+            line_dash="solid",
+            line_color=COLOR_PALETTE["crimson"],
+        )
+
+    fig.update_layout(
+        title=dict(
+            text=f"60-Day Operational Surveillance Horizon — {label} ({unit})",
+            font=dict(size=14, color="#0F172A", family="Inter, sans-serif"),
+            x=0.0,
+        ),
+        paper_bgcolor="#FFFFFF",
+        plot_bgcolor="#FFFFFF",
+        height=410,
+        margin=dict(l=45, r=25, t=50, b=40),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1.0,
+            font=dict(size=11, color="#475569"),
+        ),
+        xaxis=dict(
+            title="Execution Date",
+            showgrid=True,
+            gridcolor="#F1F5F9",
+            linecolor="#CBD5E1",
+            tickfont=dict(size=11, color="#475569"),
+        ),
+        yaxis=dict(
+            title=f"{label} ({unit})",
+            showgrid=True,
+            gridcolor="#F1F5F9",
+            linecolor="#CBD5E1",
+            tickfont=dict(size=11, color="#475569"),
+        ),
+        hovermode="x unified",
+    )
+    return fig
+
+
+def build_waterfall_chart(
+    df_slices: pd.DataFrame,
+    baseline_val: float,
+    target_val: float,
+    kpi_key: str,
+    top_n: int = 6,
+    scope_title: str = "Top Contributing Drivers",
+) -> go.Figure:
+    """Construct the Tab 2 Plotly Bridge / Waterfall Chart from Baseline KPI to Target Date KPI."""
+    kpi_meta = SUPPORTED_KPIS[kpi_key]
+    unit = str(kpi_meta["value_suffix"])
+    decimals = int(kpi_meta["decimals"])
+    higher_is_better = bool(kpi_meta["higher_is_better"])
+
+    sorted_df = df_slices.sort_values("variance_explained_pct", ascending=False).reset_index(
+        drop=True
+    )
+    top_df = sorted_df.head(top_n)
+    residual_contrib = float(target_val - baseline_val - top_df["total_contribution"].sum())
+
+    x_labels = ["Baseline KPI"]
+    y_values = [baseline_val]
+    measures = ["absolute"]
+    text_labels = [f"{baseline_val:.{decimals}f}{unit}"]
+
+    for _, row in top_df.iterrows():
+        c_val = float(row["total_contribution"])
+        x_labels.append(str(row["slice_short_label"]))
+        y_values.append(c_val)
+        measures.append("relative")
+        text_labels.append(f"{c_val:+.{decimals + 1}f}{unit}")
+
+    if abs(residual_contrib) > 1e-5 and len(sorted_df) > top_n:
+        x_labels.append("All Other Segments")
+        y_values.append(residual_contrib)
+        measures.append("relative")
+        text_labels.append(f"{residual_contrib:+.{decimals + 1}f}{unit}")
+
+    x_labels.append("Target Date KPI")
+    y_values.append(target_val)
+    measures.append("total")
+    text_labels.append(f"{target_val:.{decimals}f}{unit}")
+
+    inc_color = COLOR_PALETTE["teal"] if higher_is_better else COLOR_PALETTE["crimson"]
+    dec_color = COLOR_PALETTE["crimson"] if higher_is_better else COLOR_PALETTE["teal"]
+
+    fig = go.Figure(
+        go.Waterfall(
+            name="KPI Bridge",
+            orientation="v",
+            measure=measures,
+            x=x_labels,
+            y=y_values,
+            text=text_labels,
+            textposition="outside",
+            connector=dict(line=dict(color="#94A3B8", width=1.2, dash="dot")),
+            increasing=dict(marker=dict(color=inc_color)),
+            decreasing=dict(marker=dict(color=dec_color)),
+            totals=dict(marker=dict(color=COLOR_PALETTE["navy"])),
+        )
+    )
+
+    min_bound = min(baseline_val, target_val)
+    max_bound = max(baseline_val, target_val)
+    span = max(abs(max_bound - min_bound), 1.0)
+
+    fig.update_layout(
+        title=dict(
+            text=f"KPI Variance Bridge Waterfall — {scope_title}",
+            font=dict(size=13.5, color="#0F172A", family="Inter, sans-serif"),
+            x=0.0,
+        ),
+        paper_bgcolor="#FFFFFF",
+        plot_bgcolor="#FFFFFF",
+        height=430,
+        margin=dict(l=40, r=20, t=50, b=85),
+        xaxis=dict(
+            tickangle=-22,
+            tickfont=dict(size=10.5, color="#0F172A"),
+            showgrid=False,
+            linecolor="#CBD5E1",
+        ),
+        yaxis=dict(
+            title=f"{kpi_meta['label']} ({unit})",
+            range=[min_bound - span * 0.45, max_bound + span * 0.35],
+            showgrid=True,
+            gridcolor="#F1F5F9",
+            linecolor="#CBD5E1",
+        ),
+        showlegend=False,
+    )
+    return fig
+
+
+def build_mix_rate_bar_chart(
+    df_slices: pd.DataFrame,
+    kpi_key: str,
+    top_n: int = 8,
+    scope_title: str = "Top Contributing Drivers",
+) -> go.Figure:
+    """Construct the Tab 2 Mix vs. Rate Stacked Horizontal Bar Chart."""
+    kpi_meta = SUPPORTED_KPIS[kpi_key]
+    delta_unit = str(kpi_meta["delta_unit"])
+
+    top_df = (
+        df_slices.sort_values("variance_explained_pct", ascending=False)
+        .head(top_n)
+        .iloc[::-1]
+        .reset_index(drop=True)
+    )
+
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Bar(
+            y=top_df["slice_short_label"],
+            x=top_df["rate_effect"],
+            name="Rate Effect (Within-Segment Performance Change)",
+            orientation="h",
+            marker=dict(color=COLOR_PALETTE["crimson"]),
+            hovertemplate="<b>%{y}</b><br>Rate Effect: %{x:+.3f} " + delta_unit + "<extra></extra>",
+        )
+    )
+
+    fig.add_trace(
+        go.Bar(
+            y=top_df["slice_short_label"],
+            x=top_df["mix_effect"],
