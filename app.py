@@ -558,3 +558,263 @@ def build_mix_rate_bar_chart(
         go.Bar(
             y=top_df["slice_short_label"],
             x=top_df["mix_effect"],
+            name="Mix Effect (Volume Share Shift)",
+            orientation="h",
+            marker=dict(color=COLOR_PALETTE["navy"]),
+            hovertemplate="<b>%{y}</b><br>Mix Effect: %{x:+.3f} " + delta_unit + "<extra></extra>",
+        )
+    )
+
+    fig.add_vline(x=0.0, line_width=1.2, line_color="#475569")
+
+    fig.update_layout(
+        title=dict(
+            text=f"Rate vs. Volume Mix Decomposition ({delta_unit}) — {scope_title}",
+            font=dict(size=13.5, color="#0F172A", family="Inter, sans-serif"),
+            x=0.0,
+        ),
+        barmode="relative",
+        paper_bgcolor="#FFFFFF",
+        plot_bgcolor="#FFFFFF",
+        height=430,
+        margin=dict(l=180, r=25, t=50, b=45),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1.0,
+            font=dict(size=10.5, color="#475569"),
+        ),
+        xaxis=dict(
+            title=f"Contribution to Top-Level KPI Delta ({delta_unit})",
+            showgrid=True,
+            gridcolor="#F1F5F9",
+            linecolor="#CBD5E1",
+        ),
+        yaxis=dict(
+            showgrid=False,
+            linecolor="#CBD5E1",
+            tickfont=dict(size=10.5, color="#0F172A"),
+        ),
+    )
+    return fig
+
+
+def build_hierarchical_drilldown_chart(
+    target_df: pd.DataFrame,
+    kpi_key: str,
+    hierarchy_cols: List[str],
+    chart_type: str = "Sunburst",
+) -> go.Figure:
+    """Construct the Tab 3 Interactive Sunburst or Treemap multi-dimensional hierarchy chart."""
+    kpi_meta = SUPPORTED_KPIS[kpi_key]
+    higher_is_better = bool(kpi_meta["higher_is_better"])
+    label = str(kpi_meta["label"])
+    unit = str(kpi_meta["value_suffix"])
+
+    grouped = (
+        target_df.groupby(hierarchy_cols, dropna=False)
+        .agg(
+            execution_volume=(kpi_key, "count"),
+            kpi_metric=(kpi_key, "mean"),
+        )
+        .reset_index()
+    )
+
+    color_scale = (
+        ["#DC2626", "#FDE68A", "#0D9488"]
+        if higher_is_better
+        else ["#0D9488", "#FDE68A", "#DC2626"]
+    )
+
+    hierarchy_title = " -> ".join(DIMENSION_LABELS.get(c, c) for c in hierarchy_cols)
+
+    if chart_type == "Treemap":
+        fig = px.treemap(
+            grouped,
+            path=hierarchy_cols,
+            values="execution_volume",
+            color="kpi_metric",
+            color_continuous_scale=color_scale,
+            labels={"kpi_metric": f"{label} ({unit})", "execution_volume": "Executions"},
+        )
+    else:
+        fig = px.sunburst(
+            grouped,
+            path=hierarchy_cols,
+            values="execution_volume",
+            color="kpi_metric",
+            color_continuous_scale=color_scale,
+            labels={"kpi_metric": f"{label} ({unit})", "execution_volume": "Executions"},
+        )
+
+    fig.update_layout(
+        title=dict(
+            text=f"Multi-Dimensional Hierarchy Drilldown ({hierarchy_title})",
+            font=dict(size=13.5, color="#0F172A", family="Inter, sans-serif"),
+            x=0.0,
+        ),
+        paper_bgcolor="#FFFFFF",
+        plot_bgcolor="#FFFFFF",
+        height=470,
+        margin=dict(l=15, r=15, t=48, b=15),
+        coloraxis_colorbar=dict(title=f"{unit}"),
+    )
+    return fig
+
+
+def main() -> None:
+    """Render the Automated KPI Variance & Root-Cause Triage Engine interface."""
+    inject_institutional_css()
+
+    daily_df = load_daily_warehouse_series()
+
+    # ------------------------------------------------------------------
+    # Top Institutional Header
+    # ------------------------------------------------------------------
+    st.markdown(
+        """
+        <div class="portal-header">
+            <div class="portal-eyebrow">ENTERPRISE OPERATIONS ANALYTICS // AUTOMATED DIAGNOSTIC WORKBENCH</div>
+            <div class="portal-title">Automated KPI Variance &amp; Root-Cause Triage Engine</div>
+            <div class="portal-subtitle">
+                Statistical time-series surveillance, recursive Berman/Kitagawa Mix vs. Rate attribution,
+                and multi-dimensional root-cause isolation across 60,000 Star-Schema workflow executions.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ------------------------------------------------------------------
+    # Top Horizontal Control Bar
+    # ------------------------------------------------------------------
+    ctrl_col1, ctrl_col2, ctrl_col3, ctrl_col4 = st.columns([1.35, 1.45, 1.15, 1.05])
+
+    kpi_options = list(SUPPORTED_KPIS.keys())
+    with ctrl_col1:
+        selected_kpi = st.selectbox(
+            "Target Operational KPI",
+            options=kpi_options,
+            format_func=lambda k: f"{SUPPORTED_KPIS[k]['label']} ({SUPPORTED_KPIS[k]['unit']})",
+            index=0,
+        )
+
+    with ctrl_col4:
+        z_threshold = st.slider(
+            "Z-Score Sensitivity Threshold",
+            min_value=1.5,
+            max_value=3.5,
+            value=float(Z_SCORE_THRESHOLD),
+            step=0.1,
+        )
+
+    # Run Anomaly Detector on selected KPI to annotate dates in selector
+    detector = KPIAnomalyDetector(z_threshold=z_threshold)
+    surveillance_df = detector.analyze_series(daily_df, selected_kpi)
+
+    # Track KPI selection changes to default to that KPI's primary surgical anomaly date
+    default_day_idx = int(SUPPORTED_KPIS[selected_kpi]["default_anomaly_day_index"])
+    date_list = surveillance_df["execution_date"].tolist()
+    day_idx_list = surveillance_df["day_index"].tolist()
+    default_date_idx = (
+        day_idx_list.index(default_day_idx)
+        if default_day_idx in day_idx_list
+        else len(date_list) - 1
+    )
+
+    if "last_selected_kpi" not in st.session_state or st.session_state["last_selected_kpi"] != selected_kpi:
+        st.session_state["last_selected_kpi"] = selected_kpi
+        st.session_state["target_date_select"] = date_list[default_date_idx]
+
+    date_label_map: Dict[str, str] = {}
+    for _, r in surveillance_df.iterrows():
+        d_str = str(r["execution_date"])
+        d_idx = int(r["day_index"])
+        flag_suffix = f" [ANOMALY: Z={r['z_score']:+.2f}]" if bool(r["is_anomaly"]) else ""
+        date_label_map[d_str] = f"{d_str} (Day {d_idx:02d}){flag_suffix}"
+
+    with ctrl_col2:
+        selected_date = st.selectbox(
+            "Target Analysis Date",
+            options=date_list,
+            format_func=lambda d: date_label_map.get(d, d),
+            key="target_date_select",
+        )
+
+    with ctrl_col3:
+        selected_baseline_mode = st.selectbox(
+            "Baseline Comparison Mode",
+            options=BASELINE_MODES,
+            index=0,
+        )
+
+    # ------------------------------------------------------------------
+    # Execute Surveillance Summary & Variance Attribution Engine
+    # ------------------------------------------------------------------
+    day_summary = detector.get_target_day_summary(
+        surveillance_df=surveillance_df,
+        target_date=selected_date,
+        baseline_mode=selected_baseline_mode,
+    )
+
+    baseline_dates = day_summary["baseline_dates"]
+    baseline_records_df = load_window_fact_records(tuple(baseline_dates))
+    target_records_df = load_window_fact_records((selected_date,))
+
+    engine = VarianceAttributionEngine()
+    attribution = engine.run_full_attribution(
+        baseline_df=baseline_records_df,
+        target_df=target_records_df,
+        kpi_key=selected_kpi,
+        z_score=day_summary["z_score"],
+        p_value=day_summary["p_value"],
+    )
+
+    kpi_meta = SUPPORTED_KPIS[selected_kpi]
+    unit = str(kpi_meta["value_suffix"])
+    delta_unit = str(kpi_meta["delta_unit"])
+    decimals = int(kpi_meta["decimals"])
+    higher_is_better = bool(kpi_meta["higher_is_better"])
+
+    # ------------------------------------------------------------------
+    # Executive Diagnostic Banner
+    # ------------------------------------------------------------------
+    top_2d = attribution["top_2d_driver"]
+    banner_class = "exec-banner exec-banner-critical" if day_summary["is_anomaly"] else "exec-banner"
+    status_badge_text = day_summary["status_badge"]
+    if day_summary["severity"] == "SEVERITY_HIGH":
+        badge_css = "status-badge badge-critical"
+    elif day_summary["severity"] == "SEVERITY_MODERATE":
+        badge_css = "status-badge badge-moderate"
+    else:
+        badge_css = "status-badge badge-normal"
+
+    st.markdown(
+        f"""
+        <div class="{banner_class}">
+            <div class="exec-banner-header">
+                <span class="exec-banner-label">AUTOMATED EXECUTIVE DIAGNOSTIC BRIEF // {selected_date} (DAY {day_summary['day_index']})</span>
+                <span class="{badge_css}">{status_badge_text}</span>
+            </div>
+            <div class="exec-banner-body">
+                {attribution['executive_narrative']}
+            </div>
+            <div class="exec-meta-strip">
+                <div class="exec-meta-item"><strong>Primary 2D Driver:</strong> {top_2d['slice_label']}</div>
+                <div class="exec-meta-item"><strong>Variance Explained:</strong> {top_2d['variance_explained_pct']:.1f}%</div>
+                <div class="exec-meta-item"><strong>Rate vs. Mix Split:</strong> {top_2d['rate_share_of_slice_pct']:.1f}% Rate / {top_2d['mix_share_of_slice_pct']:.1f}% Mix</div>
+                <div class="exec-meta-item"><strong>Slice Significance:</strong> p = {top_2d['p_value']:.2e} (Welch t = {top_2d['t_statistic']:+.2f})</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ------------------------------------------------------------------
+    # 4 Core KPI Cards
+    # ------------------------------------------------------------------
+    target_val = attribution["target_overall"]
+    base_val = attribution["baseline_overall"]
+    total_delta = attribution["total_delta"]
