@@ -818,3 +818,223 @@ def main() -> None:
     target_val = attribution["target_overall"]
     base_val = attribution["baseline_overall"]
     total_delta = attribution["total_delta"]
+    rel_pct = (total_delta / base_val * 100.0) if base_val != 0 else 0.0
+
+    is_adverse = (higher_is_better and total_delta < 0) or (not higher_is_better and total_delta > 0)
+    delta_color_class = "kpi-card-value-crimson" if is_adverse else "kpi-card-value-teal"
+
+    card_c1, card_c2, card_c3, card_c4 = st.columns(4)
+
+    with card_c1:
+        st.markdown(
+            f"""
+            <div class="kpi-card">
+                <div class="kpi-card-label">Target Date Value ({selected_date})</div>
+                <div class="kpi-card-value">{target_val:.{decimals}f}{unit}</div>
+                <div class="kpi-card-sub">Sample Size: {len(target_records_df):,} workflow executions</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with card_c2:
+        st.markdown(
+            f"""
+            <div class="kpi-card">
+                <div class="kpi-card-label">Baseline Value ({selected_baseline_mode})</div>
+                <div class="kpi-card-value">{base_val:.{decimals}f}{unit}</div>
+                <div class="kpi-card-sub">Window: {len(baseline_dates)} day(s) ({len(baseline_records_df):,} executions)</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with card_c3:
+        st.markdown(
+            f"""
+            <div class="kpi-card">
+                <div class="kpi-card-label">Absolute &amp; Relative Variance (Delta)</div>
+                <div class="kpi-card-value {delta_color_class}">{total_delta:+.{decimals}f} {delta_unit}</div>
+                <div class="kpi-card-sub">Relative Shift: {rel_pct:+.2f}% vs. baseline</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with card_c4:
+        p_display = "< 0.0001" if day_summary["p_value"] < 0.0001 else f"= {day_summary['p_value']:.4f}"
+        st.markdown(
+            f"""
+            <div class="kpi-card">
+                <div class="kpi-card-label">Statistical Z-Score &amp; Control Status</div>
+                <div class="kpi-card-value">Z = {day_summary['z_score']:+.2f}</div>
+                <div class="kpi-card-sub"><span class="{badge_css}">{status_badge_text}</span> &nbsp; p {p_display}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("<div style='height: 0.85rem;'></div>", unsafe_allow_html=True)
+
+    # ------------------------------------------------------------------
+    # 4 Analytical Workbench Tabs
+    # ------------------------------------------------------------------
+    tab1, tab2, tab3, tab4 = st.tabs(
+        [
+            "Tab 1: Time-Series Surveillance & Control Bands",
+            "Tab 2: Variance Waterfall & Mix/Rate Decomposition",
+            "Tab 3: Multi-Dimensional Root-Cause Isolation Matrix",
+            "Tab 4: Record-Level Drilldown & Audit Export",
+        ]
+    )
+
+    # ==================================================================
+    # TAB 1: TIME-SERIES SURVEILLANCE & CONTROL BANDS
+    # ==================================================================
+    with tab1:
+        st.plotly_chart(
+            build_surveillance_chart(
+                surveillance_df=surveillance_df,
+                kpi_key=selected_kpi,
+                selected_date=selected_date,
+                z_threshold=z_threshold,
+            ),
+            use_container_width=True,
+        )
+
+        col_anom_left, col_anom_right = st.columns([1.05, 1.15])
+
+        with col_anom_left:
+            st.markdown(
+                """
+                <div class="section-card">
+                    <div class="section-title">Detected Statistical Anomalies — Active KPI</div>
+                    <div class="section-subtitle">
+                        Dates breaching the Z-score control threshold across the 60-day surveillance window.
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            flagged_df = surveillance_df[surveillance_df["is_anomaly"]].sort_values(
+                "abs_z_score", ascending=False
+            )
+            if flagged_df.empty:
+                st.info("No dates breached the current Z-score threshold for this KPI.")
+            else:
+                display_anom = pd.DataFrame(
+                    {
+                        "Date": flagged_df["execution_date"],
+                        "Day": flagged_df["day_index"],
+                        f"Observed ({unit})": flagged_df["kpi_value"].round(decimals),
+                        f"14D Baseline ({unit})": flagged_df["prior_14d_mean"].round(decimals),
+                        f"Delta ({delta_unit})": flagged_df["prior_14d_delta"].round(decimals),
+                        "Z-Score": flagged_df["z_score"].round(2),
+                        "P-Value": flagged_df["p_value"].map(lambda p: f"{p:.2e}"),
+                        "Status": flagged_df["status_badge"],
+                    }
+                )
+                st.dataframe(display_anom, use_container_width=True, hide_index=True)
+
+        with col_anom_right:
+            st.markdown(
+                """
+                <div class="section-card">
+                    <div class="section-title">Warehouse Cross-KPI Anomaly Catalog (60-Day Horizon)</div>
+                    <div class="section-subtitle">
+                        Summary of all detected high-severity anomalies across all 3 operational KPIs.
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            cross_rows: List[Dict[str, Any]] = []
+            for k_name, k_cfg in SUPPORTED_KPIS.items():
+                s_df = detector.analyze_series(daily_df, k_name)
+                for _, a_row in s_df[s_df["is_anomaly"]].iterrows():
+                    u = str(k_cfg["value_suffix"])
+                    dec = int(k_cfg["decimals"])
+                    cross_rows.append(
+                        {
+                            "KPI": str(k_cfg["label"]),
+                            "Anomaly Date": f"{a_row['execution_date']} (Day {int(a_row['day_index'])})",
+                            "Baseline": f"{a_row['prior_14d_mean']:.{dec}f}{u}",
+                            "Observed": f"{a_row['kpi_value']:.{dec}f}{u}",
+                            "Delta": f"{a_row['prior_14d_delta']:+.{dec}f} {k_cfg['delta_unit']}",
+                            "Z-Score": f"{a_row['z_score']:+.2f}",
+                            "Severity": str(a_row["status_badge"]),
+                        }
+                    )
+            st.dataframe(pd.DataFrame(cross_rows), use_container_width=True, hide_index=True)
+
+    # ==================================================================
+    # TAB 2: VARIANCE WATERFALL & MIX/RATE DECOMPOSITION
+    # ==================================================================
+    with tab2:
+        scope_options = ["Top 2D Root-Cause Interactions"] + [
+            f"1D Dimension: {DIMENSION_LABELS[d]} ({d})" for d in DIMENSIONS
+        ]
+        wf_ctrl1, wf_ctrl2 = st.columns([1.8, 1.2])
+        with wf_ctrl1:
+            selected_scope = st.selectbox(
+                "Decomposition View Scope",
+                options=scope_options,
+                index=0,
+            )
+        with wf_ctrl2:
+            top_n_bars = st.slider(
+                "Maximum Slices Displayed in Bridge",
+                min_value=4,
+                max_value=12,
+                value=6,
+                step=1,
+            )
+
+        if selected_scope == "Top 2D Root-Cause Interactions":
+            # Filter to the top-ranked 2D dimension pair so the bridge steps are mutually exclusive
+            top_pair_key = str(attribution["top_2d_driver"]["dimension_key"])
+            top_pair_label = str(attribution["top_2d_driver"]["dimension_label"])
+            active_slices_df = attribution["df_2d"][
+                attribution["df_2d"]["dimension_key"] == top_pair_key
+            ].copy()
+            scope_title = f"Primary 2D Interaction Grid ({top_pair_label})"
+        else:
+            chosen_dim = [
+                d for d in DIMENSIONS if f"({d})" in selected_scope
+            ][0]
+            active_slices_df = attribution["df_1d"][
+                attribution["df_1d"]["dimension_key"] == chosen_dim
+            ].copy()
+            scope_title = f"Single Dimension ({DIMENSION_LABELS[chosen_dim]})"
+
+        chart_col1, chart_col2 = st.columns(2)
+        with chart_col1:
+            st.plotly_chart(
+                build_waterfall_chart(
+                    df_slices=active_slices_df,
+                    baseline_val=base_val,
+                    target_val=target_val,
+                    kpi_key=selected_kpi,
+                    top_n=top_n_bars,
+                    scope_title=scope_title,
+                ),
+                use_container_width=True,
+            )
+        with chart_col2:
+            st.plotly_chart(
+                build_mix_rate_bar_chart(
+                    df_slices=active_slices_df,
+                    kpi_key=selected_kpi,
+                    top_n=min(top_n_bars + 2, len(active_slices_df)),
+                    scope_title=scope_title,
+                ),
+                use_container_width=True,
+            )
+
+        # Mathematical Reconciliation Proof Table across all 6 Single Dimensions
+        st.markdown(
+            """
+            <div class="section-card">
+                <div class="section-title">Exact Mathematical Variance Reconciliation Check (Berman/Kitagawa Identity)</div>
+                <div class="section-subtitle">
+                    Verifies that across every single analytical dimension, Sum(Rate Effect) + Sum(Mix Effect) reconciles to 100.0% of the Top-Level KPI Delta.
