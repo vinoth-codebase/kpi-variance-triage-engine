@@ -103,3 +103,80 @@ def test_anomaly_detector_flags_day_60_and_all_surgical_anomalies() -> None:
 
 
 def test_single_dimension_variance_reconciles_to_100_percent() -> None:
+    """
+    Verify that for every single dimension (D1), the sum of Rate Effect + Mix Effect
+    mathematically reconciles to 100% of the top-level KPI delta (pytest.approx).
+    """
+    daily_df = fetch_daily_kpi_series(DB_PATH)
+    detector = KPIAnomalyDetector(z_threshold=2.0)
+    sla_surv = detector.analyze_series(daily_df, "sla_compliance_rate")
+
+    target_date = str(sla_surv[sla_surv["day_index"] == 60].iloc[0]["execution_date"])
+    baseline_dates = detector.get_baseline_dates(sla_surv, target_date, "Prior 14-Day Baseline")
+
+    baseline_df = fetch_records_for_dates(baseline_dates, DB_PATH)
+    target_df = fetch_records_for_dates([target_date], DB_PATH)
+
+    engine = VarianceAttributionEngine()
+    result = engine.run_full_attribution(
+        baseline_df=baseline_df,
+        target_df=target_df,
+        kpi_key="sla_compliance_rate",
+    )
+
+    total_kpi_delta = float(result["total_delta"])
+    df_1d = result["df_1d"]
+
+    for dim_col in DIMENSIONS:
+        dim_slices = df_1d[df_1d["dimension_key"] == dim_col]
+        assert not dim_slices.empty
+        reconciled_delta = float((dim_slices["rate_effect"] + dim_slices["mix_effect"]).sum())
+        reconciled_pct = float(dim_slices["variance_explained_pct"].sum())
+
+        assert reconciled_delta == pytest.approx(total_kpi_delta, rel=1e-6, abs=1e-6)
+        assert reconciled_pct == pytest.approx(100.0, rel=1e-6, abs=1e-6)
+
+
+def test_day_60_ranks_core_data_engineering_and_snowflake_prod_eu_first() -> None:
+    """
+    Verify the attribution engine correctly ranks Core Data Engineering + Snowflake-Prod-EU
+    as the #1 root-cause driver on Day 60, explaining ~84% of the total drop.
+    """
+    daily_df = fetch_daily_kpi_series(DB_PATH)
+    detector = KPIAnomalyDetector(z_threshold=2.0)
+    sla_surv = detector.analyze_series(daily_df, "sla_compliance_rate")
+
+    day_60_row = sla_surv[sla_surv["day_index"] == 60].iloc[0]
+    target_date = str(day_60_row["execution_date"])
+    baseline_dates = detector.get_baseline_dates(sla_surv, target_date, "Prior 14-Day Baseline")
+
+    baseline_df = fetch_records_for_dates(baseline_dates, DB_PATH)
+    target_df = fetch_records_for_dates([target_date], DB_PATH)
+
+    engine = VarianceAttributionEngine()
+    result = engine.run_full_attribution(
+        baseline_df=baseline_df,
+        target_df=target_df,
+        kpi_key="sla_compliance_rate",
+        z_score=float(day_60_row["z_score"]),
+        p_value=float(day_60_row["p_value"]),
+    )
+
+    top_2d = result["top_2d_driver"]
+    assert top_2d["slice_short_label"] == "Core Data Engineering + Snowflake-Prod-EU"
+    assert "delivery_tower = Core Data Engineering" in top_2d["slice_label"]
+    assert "system_environment = Snowflake-Prod-EU" in top_2d["slice_label"]
+    assert float(top_2d["variance_explained_pct"]) == pytest.approx(84.2, abs=1.0)
+    assert bool(top_2d["is_significant"]) is True
+    assert float(top_2d["p_value"]) < 0.0001
+
+    # Also verify combined leaderboard #1 2D slice is Core Data Engineering + Snowflake-Prod-EU
+    top_combined_2d = result["df_2d"].iloc[0]
+    assert top_combined_2d["slice_short_label"] == "Core Data Engineering + Snowflake-Prod-EU"
+
+    # Verify Decision Tree rules and Executive Narrative are populated
+    assert len(result["decision_tree_rules"]) > 0
+    assert "Core Data Engineering" in result["executive_narrative"]
+    assert "Snowflake-Prod-EU" in result["executive_narrative"]
+
+
