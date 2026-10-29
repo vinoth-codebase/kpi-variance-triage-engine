@@ -1038,3 +1038,234 @@ def main() -> None:
                 <div class="section-title">Exact Mathematical Variance Reconciliation Check (Berman/Kitagawa Identity)</div>
                 <div class="section-subtitle">
                     Verifies that across every single analytical dimension, Sum(Rate Effect) + Sum(Mix Effect) reconciles to 100.0% of the Top-Level KPI Delta.
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        recon_rows: List[Dict[str, Any]] = []
+        df_1d_all = attribution["df_1d"]
+        for dim_col in DIMENSIONS:
+            sub = df_1d_all[df_1d_all["dimension_key"] == dim_col]
+            sum_rate = float(sub["rate_effect"].sum())
+            sum_mix = float(sub["mix_effect"].sum())
+            sum_total = float(sub["total_contribution"].sum())
+            sum_pct = float(sub["variance_explained_pct"].sum())
+            top_seg = sub.sort_values("variance_explained_pct", ascending=False).iloc[0]
+            recon_rows.append(
+                {
+                    "Dimension": DIMENSION_LABELS[dim_col],
+                    "Distinct Segments": len(sub),
+                    "Top Contributing Segment": str(top_seg["slice_short_label"]),
+                    "Top Segment Share (%)": f"{top_seg['variance_explained_pct']:.1f}%",
+                    f"Sum Rate Effect ({delta_unit})": f"{sum_rate:+.4f}",
+                    f"Sum Mix Effect ({delta_unit})": f"{sum_mix:+.4f}",
+                    f"Reconciled Total Delta ({delta_unit})": f"{sum_total:+.4f}",
+                    "Total Variance Explained (%)": f"{sum_pct:.2f}%",
+                }
+            )
+        st.dataframe(pd.DataFrame(recon_rows), use_container_width=True, hide_index=True)
+
+    # ==================================================================
+    # TAB 3: MULTI-DIMENSIONAL ROOT-CAUSE ISOLATION MATRIX
+    # ==================================================================
+    with tab3:
+        m_col1, m_col2, m_col3 = st.columns([1.2, 1.2, 1.0])
+        with m_col1:
+            dim_type_filter = st.selectbox(
+                "Slice Dimensionality Filter",
+                options=["All Slices (1D + 2D)", "2D Interactions Only", "1D Single Dimensions Only"],
+                index=0,
+            )
+        with m_col2:
+            hierarchy_mode = st.selectbox(
+                "Drilldown Hierarchy Path",
+                options=[
+                    "Default Spec: Delivery Tower -> System Environment -> Shift Tier",
+                    "KPI Optimal Hierarchy Path",
+                ],
+                index=0,
+            )
+        with m_col3:
+            hierarchy_chart_type = st.radio(
+                "Hierarchy Chart Type",
+                options=["Sunburst", "Treemap"],
+                horizontal=True,
+            )
+
+        leaderboard_df = attribution["combined_leaderboard"].copy()
+        if dim_type_filter == "2D Interactions Only":
+            leaderboard_df = leaderboard_df[leaderboard_df["dimension_type"] == "2D"]
+        elif dim_type_filter == "1D Single Dimensions Only":
+            leaderboard_df = leaderboard_df[leaderboard_df["dimension_type"] == "1D"]
+
+        st.markdown(
+            """
+            <div class="section-card">
+                <div class="section-title">Multi-Dimensional Root-Cause Isolation Matrix (Ranked by % Variance Explained)</div>
+                <div class="section-subtitle">
+                    Combinatorial evaluation across all 1D and 2D slices with Welch two-sample t-test p-values and exact Mix/Rate attribution.
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        display_matrix = pd.DataFrame(
+            {
+                "Rank": range(1, len(leaderboard_df.head(25)) + 1),
+                "Type": leaderboard_df.head(25)["dimension_type"],
+                "Dimension(s)": leaderboard_df.head(25)["dimension_label"],
+                "Segment Slice": leaderboard_df.head(25)["slice_label"],
+                "Target Vol": leaderboard_df.head(25)["target_volume"],
+                f"Baseline ({unit})": leaderboard_df.head(25)["baseline_metric"].round(decimals),
+                f"Target ({unit})": leaderboard_df.head(25)["target_metric"].round(decimals),
+                f"Delta ({delta_unit})": leaderboard_df.head(25)["metric_delta"].round(decimals),
+                f"Rate Effect ({delta_unit})": leaderboard_df.head(25)["rate_effect"].round(3),
+                f"Mix Effect ({delta_unit})": leaderboard_df.head(25)["mix_effect"].round(3),
+                f"Contribution ({delta_unit})": leaderboard_df.head(25)["total_contribution"].round(3),
+                "% Variance Explained": leaderboard_df.head(25)["variance_explained_pct"].map(
+                    lambda v: f"{v:.1f}%"
+                ),
+                "P-Value": leaderboard_df.head(25)["p_value"].map(
+                    lambda p: "< 0.0001" if p < 0.0001 else f"{p:.4f}"
+                ),
+            }
+        )
+        st.dataframe(display_matrix, use_container_width=True, hide_index=True)
+
+        sun_col, tree_col = st.columns([1.25, 1.0])
+        with sun_col:
+            if hierarchy_mode.startswith("Default Spec"):
+                h_cols = ["delivery_tower", "system_environment", "shift_tier"]
+            else:
+                h_cols = list(kpi_meta["sunburst_hierarchy"])
+
+            st.plotly_chart(
+                build_hierarchical_drilldown_chart(
+                    target_df=target_records_df,
+                    kpi_key=selected_kpi,
+                    hierarchy_cols=h_cols,
+                    chart_type=hierarchy_chart_type,
+                ),
+                use_container_width=True,
+            )
+
+        with tree_col:
+            st.markdown(
+                """
+                <div class="section-card">
+                    <div class="section-title">Decision-Tree Failure Cluster Rules (max_depth = 3)</div>
+                    <div class="section-subtitle">
+                        Automated scikit-learn DecisionTreeRegressor partition rules ranking highest-density failure pockets on the Target Date.
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            tree_rules = attribution.get("decision_tree_rules", [])
+            if tree_rules:
+                tree_df = pd.DataFrame(
+                    [
+                        {
+                            "Cluster Rank": idx + 1,
+                            "Decision Rule Path": r["rule_path"],
+                            "Executions": r["sample_count"],
+                            f"Cluster {unit}": f"{r['leaf_metric']:.{decimals}f}{unit}",
+                            f"vs. Day Mean ({delta_unit})": f"{r['metric_deviation']:+.{decimals}f}",
+                        }
+                        for idx, r in enumerate(tree_rules[:8])
+                    ]
+                )
+                st.dataframe(tree_df, use_container_width=True, hide_index=True)
+
+    # ==================================================================
+    # TAB 4: RECORD-LEVEL DRILLDOWN & AUDIT EXPORT
+    # ==================================================================
+    with tab4:
+        primary_filter: Dict[str, str] = top_2d["slice_filter"]
+        primary_slice_str = top_2d["slice_label"]
+
+        drill_ctrl1, drill_ctrl2 = st.columns([1.6, 1.0])
+        with drill_ctrl1:
+            filter_mode = st.radio(
+                "Fact Record Inspection Scope",
+                options=[
+                    f"Auto-Isolated #1 Root-Cause Segment: [{primary_slice_str}]",
+                    "All Target Date Workflow Executions (Unfiltered)",
+                ],
+                horizontal=False,
+            )
+
+        active_filter = primary_filter if filter_mode.startswith("Auto-Isolated") else None
+        raw_drilldown_df = fetch_filtered_fact_records(
+            execution_date=selected_date,
+            dimension_filters=active_filter,
+            limit=1000,
+            db_path=DB_PATH,
+        )
+
+        with drill_ctrl2:
+            st.markdown(
+                """
+                <div class="section-card">
+                    <div class="section-title">Executive Root-Cause Audit Pack (Excel)</div>
+                    <div class="section-subtitle">
+                        Generate 4-sheet openpyxl report (Executive_Summary, 1D_Dimension_Breakdown, 2D_Interaction_Ranking, Anomalous_Raw_Records).
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            export_path = generate_audit_pack_excel(
+                kpi_key=selected_kpi,
+                surveillance_summary=day_summary,
+                attribution_results=attribution,
+                raw_records_df=raw_drilldown_df,
+                output_dir=EXPORTS_DIR,
+            )
+            with open(export_path, "rb") as f_excel:
+                excel_bytes = f_excel.read()
+
+            st.download_button(
+                label=f"Download Excel Audit Report ({export_path.name})",
+                data=excel_bytes,
+                file_name=export_path.name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+
+        # Summary telemetry for the isolated raw records
+        s_c1, s_c2, s_c3, s_c4 = st.columns(4)
+        total_slice_rows = len(raw_drilldown_df)
+        sla_breaches = int((raw_drilldown_df["sla_met"] == 0).sum()) if total_slice_rows > 0 else 0
+        fpy_defects = int((raw_drilldown_df["first_pass_yield"] == 0).sum()) if total_slice_rows > 0 else 0
+        non_none_errors = raw_drilldown_df[raw_drilldown_df["error_code"] != "NONE"]
+        dominant_error = (
+            str(non_none_errors["error_code"].mode().iloc[0])
+            if not non_none_errors.empty
+            else "NONE"
+        )
+
+        s_c1.metric("Isolated Workflow Executions", f"{total_slice_rows:,}")
+        s_c2.metric("SLA Breach Count", f"{sla_breaches:,}")
+        s_c3.metric("First-Pass Defect Count", f"{fpy_defects:,}")
+        s_c4.metric("Dominant Diagnostic Error Code", dominant_error)
+
+        st.markdown(
+            f"""
+            <div class="section-card">
+                <div class="section-title">Granular SQLite Fact Records — {selected_date}</div>
+                <div class="section-subtitle">
+                    Showing underlying workflow execution logs from fact_workflow_executions ordered by failure severity.
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.dataframe(raw_drilldown_df, use_container_width=True, hide_index=True)
+
+
+if __name__ == "__main__":
+    main()
+
