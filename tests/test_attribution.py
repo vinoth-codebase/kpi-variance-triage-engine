@@ -180,3 +180,67 @@ def test_day_60_ranks_core_data_engineering_and_snowflake_prod_eu_first() -> Non
     assert "Snowflake-Prod-EU" in result["executive_narrative"]
 
 
+def test_day_52_and_day_45_attribution_drivers_and_export(tmp_path: Path) -> None:
+    """Verify Day 52 and Day 45 root-cause rankings and Excel audit report generation."""
+    daily_df = fetch_daily_kpi_series(DB_PATH)
+    detector = KPIAnomalyDetector(z_threshold=2.0)
+    engine = VarianceAttributionEngine()
+
+    # Day 52 FPY check
+    fpy_surv = detector.analyze_series(daily_df, "first_pass_yield_rate")
+    d52_date = str(fpy_surv[fpy_surv["day_index"] == 52].iloc[0]["execution_date"])
+    b52_dates = detector.get_baseline_dates(fpy_surv, d52_date, "Prior 14-Day Baseline")
+    res_52 = engine.run_full_attribution(
+        baseline_df=fetch_records_for_dates(b52_dates, DB_PATH),
+        target_df=fetch_records_for_dates([d52_date], DB_PATH),
+        kpi_key="first_pass_yield_rate",
+    )
+    top_52 = res_52["top_2d_driver"]
+    assert "UAT Validation" in top_52["slice_label"]
+    assert "Tier-2 Contractor" in top_52["slice_label"]
+    assert float(top_52["variance_explained_pct"]) == pytest.approx(79.0, abs=1.5)
+
+    # Day 45 Resolution Hours check
+    res_surv = detector.analyze_series(daily_df, "mean_resolution_hours")
+    d45_date = str(res_surv[res_surv["day_index"] == 45].iloc[0]["execution_date"])
+    b45_dates = detector.get_baseline_dates(res_surv, d45_date, "Prior 14-Day Baseline")
+    res_45 = engine.run_full_attribution(
+        baseline_df=fetch_records_for_dates(b45_dates, DB_PATH),
+        target_df=fetch_records_for_dates([d45_date], DB_PATH),
+        kpi_key="mean_resolution_hours",
+    )
+    top_45 = res_45["top_2d_driver"]
+    assert "DACH" in top_45["slice_label"]
+    assert "Security Sign-Off" in top_45["slice_label"]
+
+    # Verify Excel export
+    day_summary = detector.get_target_day_summary(res_surv, d45_date, "Prior 14-Day Baseline")
+    raw_df = fetch_filtered_fact_records(d45_date, top_45["slice_filter"], db_path=DB_PATH)
+    xlsx_path = generate_audit_pack_excel(
+        kpi_key="mean_resolution_hours",
+        surveillance_summary=day_summary,
+        attribution_results=res_45,
+        raw_records_df=raw_df,
+        output_dir=tmp_path,
+    )
+    assert xlsx_path.exists()
+    assert xlsx_path.stat().st_size > 5000
+
+
+def test_zero_emojis_across_entire_codebase() -> None:
+    """Static scan across app.py, src/, tests/, and README.md confirming zero emojis exist."""
+    files_to_scan = [
+        BASE_DIR / "app.py",
+        BASE_DIR / "README.md",
+        BASE_DIR / "run_app.sh",
+    ]
+    files_to_scan.extend(sorted((BASE_DIR / "src").glob("*.py")))
+    files_to_scan.extend(sorted((BASE_DIR / "tests").glob("*.py")))
+
+    for file_path in files_to_scan:
+        assert file_path.exists(), f"Expected file {file_path} to exist."
+        content = file_path.read_text(encoding="utf-8")
+        matches = EMOJI_PATTERN.findall(content)
+        assert len(matches) == 0, (
+            f"Strict zero-emoji policy violated in {file_path.name}: found {matches}"
+        )
