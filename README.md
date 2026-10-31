@@ -37,3 +37,29 @@ When an operational or executive KPI suddenly degrades, analysts typically spend
 
 ---
 
+## 2. Repository Structure
+
+```text
+kpi-variance-triage-engine/
+├── .gitignore
+├── README.md
+├── requirements.txt
+├── run_app.sh
+├── data/
+│   └── exports/
+├── db/
+│   └── kpi_triage_warehouse.db
+├── src/
+│   ├── __init__.py
+│   ├── config.py
+│   ├── database.py
+│   ├── data_generator.py
+│   ├── anomaly_detector.py
+│   ├── attribution_engine.py
+│   └── exporter.py
+├── app.py
+└── tests/
+    └── test_attribution.py
+```
+
+---
