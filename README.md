@@ -63,3 +63,28 @@ kpi-variance-triage-engine/
 ```
 
 ---
+
+## 3. Quickstart & Execution (macOS Native)
+
+### Option A: One-Command Launch Script
+```bash
+chmod +x run_app.sh
+./run_app.sh
+```
+
+### Option B: Manual Virtual Environment Setup & Testing
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+# Initialize the 60,000-record Star-Schema SQLite warehouse
+python3 -m src.data_generator
+
+# Run the automated pytest verification suite
+pytest -v
+
+# Launch the Streamlit diagnostic workbench
+streamlit run app.py
+```
+
